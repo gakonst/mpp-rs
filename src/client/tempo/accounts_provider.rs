@@ -6,9 +6,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use alloy::providers::Provider;
 use tempo_alloy::accounts::{
-    TempoAccountsError, TempoAccountsWallet, TempoAuthorizationReservation,
+    TempoAccountsError, TempoAccountsStore, TempoAccountsWallet, TempoAuthorizationReservation,
 };
+use tempo_alloy::{rpc::TempoTransactionRequest, TempoNetwork};
 
 use super::{
     autoswap::AutoswapConfig,
@@ -46,6 +48,37 @@ struct AccountsSession {
     default_deposit: Option<u128>,
     top_up_amount: Option<u128>,
     max_deposit: Option<u128>,
+}
+
+enum ExecutableAccountsWallet {
+    Ready(TempoAccountsWallet),
+    Rejected(MppError),
+}
+
+fn is_access_key_rejection(error: &alloy::transports::TransportError) -> bool {
+    let Some(payload) = error.as_error_resp() else {
+        return false;
+    };
+    if payload.code == 3 {
+        return true;
+    }
+
+    // Tempo reports keychain validation failures as JSON-RPC -32603 rather
+    // than the EVM revert code. Match only deterministic key failures here;
+    // rate limits and other RPC/server errors must fail the whole preflight.
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "keychain validation failed",
+        "keynotfound",
+        "key not found",
+        "signaturetypemismatch",
+        "spendinglimitexceeded",
+        "spending limit exceeded",
+        "access key is revoked",
+        "access key has expired",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 impl TempoAccountsProvider {
@@ -257,9 +290,100 @@ impl TempoAccountsProvider {
             super::provider::apply_autoswap(charge, self.autoswap.as_ref(), &rpc_provider, from)
                 .await?;
         let request = charge.accounts_request(from)?;
-        self.wallet
-            .has_access_key_for_request(&request)
-            .mpp_config("failed to inspect Tempo Accounts access keys")
+        self.prepare_executable_wallet(&rpc_provider, &request, from, charge.chain_id())
+            .await
+            .map(|prepared| matches!(prepared, ExecutableAccountsWallet::Ready(_)))
+    }
+
+    /// Select an access key whose complete transaction succeeds against the
+    /// latest chain state, then pin that exact key through signing.
+    ///
+    /// Accounts store metadata describes a key's original policy, but spending
+    /// limits are consumed on-chain. A scope-only selection can therefore sign
+    /// a transaction with a depleted key even when a later stored key can pay.
+    /// `eth_call` understands Tempo's `keyId` and `keyType` simulation fields,
+    /// so it is the authoritative and side-effect-free check for the whole call
+    /// batch (including approvals, swaps, and transfers).
+    async fn prepare_executable_wallet<P>(
+        &self,
+        provider: &P,
+        request: &TempoTransactionRequest,
+        account: alloy::primitives::Address,
+        chain_id: u64,
+    ) -> Result<ExecutableAccountsWallet, MppError>
+    where
+        P: Provider<TempoNetwork>,
+    {
+        let candidates = if let Some(path) = self.wallet.store_path() {
+            TempoAccountsStore::open(path)
+                .mpp_config("failed to open Tempo Accounts store")?
+                .access_keys()
+                .mpp_config("failed to inspect Tempo Accounts access keys")?
+                .into_iter()
+                .filter(|key| {
+                    key.account() == account
+                        && key.chain_id() == chain_id
+                        && key.is_locally_signable()
+                })
+                .map(|key| (key.address(), key.key_type()))
+                .collect::<Vec<_>>()
+        } else {
+            let key = self
+                .wallet
+                .clone()
+                .with_chain_id(chain_id)
+                .active_access_key()
+                .mpp_config("failed to select Tempo Accounts access key")?;
+            vec![(key.address(), key.signature_type())]
+        };
+
+        let mut last_rejection = None;
+        for (key_id, key_type) in candidates {
+            let mut candidate_request = request.clone();
+            candidate_request.key_id = Some(key_id);
+            candidate_request.key_type = Some(key_type);
+            let prepared = match self
+                .wallet
+                .prepare_request(provider, &mut candidate_request)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) if error.is_local_usage_error() => {
+                    last_rejection = Some(MppError::InvalidConfig(format!(
+                        "Tempo access key {key_id} cannot prepare this payment: {error}"
+                    )));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).mpp_http("failed to prepare Tempo Accounts access key");
+                }
+            };
+
+            match provider.call(candidate_request).await {
+                Ok(_) => return Ok(ExecutableAccountsWallet::Ready(prepared)),
+                Err(error) if is_access_key_rejection(&error) => {
+                    let rejection = super::TempoClientError::from_transport_error(&error)
+                        .map(MppError::from)
+                        .unwrap_or_else(|| {
+                            MppError::Http(format!(
+                                "Tempo access key {key_id} rejected payment preflight: {error}"
+                            ))
+                        });
+                    last_rejection = Some(rejection);
+                }
+                Err(error) => {
+                    return Err(error).mpp_http("failed to preflight Tempo payment");
+                }
+            }
+        }
+
+        Ok(ExecutableAccountsWallet::Rejected(
+            last_rejection.unwrap_or_else(|| {
+                MppError::InvalidConfig(format!(
+                    "no locally signable Tempo access key for account {account} on chain {chain_id} covers this payment"
+                ))
+            }),
+        ))
     }
 
     fn settlement_rpc_url(&self, chain_id: u64) -> Result<reqwest::Url, MppError> {
@@ -348,9 +472,22 @@ impl PaymentProvider for TempoAccountsProvider {
             super::provider::apply_autoswap(charge, self.autoswap.as_ref(), &rpc_provider, from)
                 .await?;
 
+        let wallet = if charge.amount().is_zero() {
+            self.wallet.clone()
+        } else {
+            let request = charge.accounts_request(from)?;
+            match self
+                .prepare_executable_wallet(&rpc_provider, &request, from, charge.chain_id())
+                .await?
+            {
+                ExecutableAccountsWallet::Ready(wallet) => wallet,
+                ExecutableAccountsWallet::Rejected(error) => return Err(error),
+            }
+        };
+
         let signed = charge
             .sign_with_accounts_provider_options(
-                &self.wallet,
+                &wallet,
                 &rpc_provider,
                 from,
                 SignOptions {
@@ -436,7 +573,10 @@ impl PaymentProvider for TempoAccountsProvider {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, Mutex,
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -448,6 +588,7 @@ mod tests {
         signers::{local::PrivateKeySigner, Signer},
         sol_types::SolCall,
     };
+    use axum::{routing::post, Json, Router};
     use tempo_alloy::primitives::{
         transaction::{
             KeyAuthorization, KeychainVersion, PrimitiveSignature, SignatureType, TempoSignature,
@@ -461,6 +602,69 @@ mod tests {
     use tempo_alloy::rpc::TempoTransactionRequest;
 
     static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestRpc {
+        url: reqwest::Url,
+        seen_keys: Arc<Mutex<Vec<String>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestRpc {
+        async fn start(rejected_key: Option<Address>) -> Self {
+            let seen_keys = Arc::new(Mutex::new(Vec::new()));
+            let handler_seen_keys = seen_keys.clone();
+            let app = Router::new().route(
+                "/",
+                post(move |Json(request): Json<serde_json::Value>| {
+                    let seen_keys = handler_seen_keys.clone();
+                    async move {
+                        let id = request["id"].clone();
+                        let key = request["params"][0]["keyId"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned();
+                        seen_keys.lock().unwrap().push(key.clone());
+                        let rejected = rejected_key.is_some_and(|candidate| {
+                            key.eq_ignore_ascii_case(&candidate.to_string())
+                        });
+                        if rejected {
+                            Json(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": 3,
+                                    "message": "execution reverted: SpendingLimitExceeded",
+                                    "data": "0x8a9e71ea",
+                                },
+                            }))
+                        } else {
+                            Json(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": "0x",
+                            }))
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            Self {
+                url: format!("http://{address}/").parse().unwrap(),
+                seen_keys,
+                task,
+            }
+        }
+    }
+
+    impl Drop for TestRpc {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
 
     fn provider() -> (TempoAccountsProvider, std::path::PathBuf, Address) {
         let private_key = "0x1234567890123456789012345678901234567890123456789012345678901234";
@@ -591,6 +795,8 @@ mod tests {
     #[tokio::test]
     async fn challenge_preflight_checks_the_transfer_scope() {
         let (provider, path, _) = provider();
+        let rpc = TestRpc::start(None).await;
+        let provider = provider.with_rpc_url(rpc.url.clone());
         let mut store: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         store["tempo-cli.store"]["state"]["accessKeys"][0]["scopes"] = serde_json::json!([{
@@ -612,6 +818,56 @@ mod tests {
             .has_access_key_for_challenge(&challenge("100", false))
             .await
             .unwrap());
+        assert_eq!(rpc.seen_keys.lock().unwrap().len(), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn depleted_key_falls_through_to_an_executable_key() {
+        let (provider, path, account) = provider();
+        let depleted = provider.wallet().active_access_key().unwrap().address();
+        let replacement_private_key = format!("0x{}", "22".repeat(32));
+        let replacement = replacement_private_key.parse::<PrivateKeySigner>().unwrap();
+        let mut store: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        store["tempo-cli.store"]["state"]["accessKeys"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "access": account,
+                "address": replacement.address(),
+                "chainId": 4217,
+                "keyType": "secp256k1",
+                "privateKey": replacement_private_key,
+            }));
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+
+        let rpc = TestRpc::start(Some(depleted)).await;
+        let provider = provider.with_rpc_url(rpc.url.clone());
+        let credential = provider.pay(&challenge("100", true)).await.unwrap();
+        let encoded = alloy::hex::decode(
+            credential
+                .charge_payload()
+                .unwrap()
+                .signed_tx()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        let envelope =
+            crate::protocol::methods::tempo::FeePayerEnvelope78::decode_envelope(&encoded).unwrap();
+        assert_accounts_signature(
+            &envelope.to_recoverable_signed(),
+            account,
+            replacement.address(),
+        );
+        assert_eq!(
+            *rpc.seen_keys.lock().unwrap(),
+            vec![
+                format!("{depleted:#x}"),
+                format!("{:#x}", replacement.address())
+            ]
+        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -713,6 +969,8 @@ mod tests {
     #[tokio::test]
     async fn accounts_key_signs_a_sponsored_charge_without_a_signing_mode() {
         let (provider, path, account) = provider();
+        let rpc = TestRpc::start(None).await;
+        let provider = provider.with_rpc_url(rpc.url.clone());
         let key = provider.wallet().active_access_key().unwrap().address();
         let credential = provider.pay(&challenge("100", true)).await.unwrap();
 
