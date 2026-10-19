@@ -294,23 +294,17 @@ pub async fn find_route<P: Provider<tempo_alloy::TempoNetwork>>(
         TxKind::Call(token) => token,
         TxKind::Create => return None,
     };
-    let balance = ITIP20::new(token, provider)
-        .balanceOf(account)
-        .call()
-        .await
-        .ok()?;
-    if balance < route.transfer.amount {
-        return None;
-    }
-
     let mut request = TempoTransactionRequest {
         calls: route.calls.to_vec(),
         ..Default::default()
     };
     request.inner.from = Some(account);
     request.inner.chain_id = Some(chain_id);
-    provider.call(request).await.ok()?;
-    Some(route)
+    // Both reads gate the same decision, so issue them together.
+    let token = ITIP20::new(token, provider);
+    let balance = token.balanceOf(account);
+    let (balance, simulation) = tokio::join!(balance.call(), provider.call(request));
+    (balance.ok()? >= route.transfer.amount && simulation.is_ok()).then_some(route)
 }
 
 #[cfg(test)]

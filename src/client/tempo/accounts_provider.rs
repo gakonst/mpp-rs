@@ -6,10 +6,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use alloy::primitives::Address;
+use alloy::{primitives::Address, providers::RootProvider};
 use tempo_alloy::accounts::{
     TempoAccountsError, TempoAccountsWallet, TempoAuthorizationReservation,
 };
+use tempo_alloy::TempoNetwork;
 
 use super::{
     autoswap::AutoswapConfig,
@@ -43,6 +44,8 @@ pub struct TempoAccountsProvider {
     expected_chain_id: Option<u64>,
     pending_authorizations: Arc<Mutex<HashMap<String, TempoAuthorizationReservation>>>,
     session: Option<AccountsSession>,
+    /// Settlement RPC clients by URL, shared by clones so payments reuse connections.
+    rpc_providers: Arc<Mutex<HashMap<reqwest::Url, RootProvider<TempoNetwork>>>>,
 }
 
 #[derive(Clone)]
@@ -70,6 +73,7 @@ impl TempoAccountsProvider {
             expected_chain_id: None,
             pending_authorizations: Arc::new(Mutex::new(HashMap::new())),
             session: None,
+            rpc_providers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -302,7 +306,7 @@ impl TempoAccountsProvider {
             };
         }
 
-        let rpc_provider = super::rpc_provider(self.settlement_rpc_url(charge.chain_id())?);
+        let rpc_provider = self.settlement_provider(charge.chain_id())?;
         let charge =
             super::provider::apply_funding(charge, self.autoswap.as_ref(), &rpc_provider, from)
                 .await?;
@@ -310,6 +314,17 @@ impl TempoAccountsProvider {
         self.wallet
             .has_access_key_for_request(&request)
             .mpp_config("failed to inspect Tempo Accounts access keys")
+    }
+
+    fn settlement_provider(&self, chain_id: u64) -> Result<RootProvider<TempoNetwork>, MppError> {
+        let url = self.settlement_rpc_url(chain_id)?;
+        let mut providers = self.rpc_providers.lock().map_err(|_| {
+            MppError::InvalidConfig("Tempo settlement RPC clients are unavailable".to_owned())
+        })?;
+        Ok(providers
+            .entry(url)
+            .or_insert_with_key(|url| super::rpc_provider(url.clone()))
+            .clone())
     }
 
     fn settlement_rpc_url(&self, chain_id: u64) -> Result<reqwest::Url, MppError> {
@@ -408,7 +423,7 @@ impl PaymentProvider for TempoAccountsProvider {
             self.expected_chain_id,
             self.client_id.as_deref(),
         )?;
-        let rpc_provider = super::rpc_provider(self.settlement_rpc_url(charge.chain_id())?);
+        let rpc_provider = self.settlement_provider(charge.chain_id())?;
         let charge =
             super::provider::apply_funding(charge, self.autoswap.as_ref(), &rpc_provider, from)
                 .await?;
