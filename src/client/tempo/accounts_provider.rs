@@ -21,8 +21,11 @@ use crate::{
     client::{PaymentContext, PaymentProvider},
     error::{MppError, ResultExt},
     protocol::core::{PaymentChallenge, PaymentCredential},
-    protocol::intents::ChargeRequest,
-    protocol::methods::tempo::network::TempoNetwork as TempoChain,
+    protocol::intents::{ChargeRequest, SessionRequest},
+    protocol::methods::tempo::{
+        machine_token, network::TempoNetwork as TempoChain, TempoChargeExt, INTENT_CHARGE,
+        INTENT_SESSION, METHOD_NAME,
+    },
 };
 
 /// A Tempo Charge provider that selects access keys lazily from Tempo
@@ -49,6 +52,7 @@ struct AccountsSession {
     default_deposit: Option<u128>,
     top_up_amount: Option<u128>,
     max_deposit: Option<u128>,
+    fee_token: Option<Address>,
 }
 
 impl TempoAccountsProvider {
@@ -106,16 +110,20 @@ impl TempoAccountsProvider {
         self.autoswap.as_ref()
     }
 
-    /// Prefer Tempo Charge offers denominated in this currency.
+    /// Prefer Tempo offers funded from this currency.
     ///
-    /// The provider falls back to the protocol-ranked first challenge when a
-    /// matching currency is not offered.
+    /// Among the protocol-ranked challenges, the first charge or session
+    /// denominated in `currency` is selected. When `currency` is the chain's
+    /// canonical machine token (MACH), a machine-token-enabled charge also
+    /// qualifies, since it is paid in MACH and settled in its challenge
+    /// currency. The provider falls back to the first challenge when no
+    /// challenge qualifies.
     pub fn with_preferred_currency(mut self, currency: Address) -> Self {
         self.preferred_currency = Some(currency);
         self
     }
 
-    /// Get the preferred Tempo Charge currency, if configured.
+    /// Get the preferred funding currency, if configured.
     pub const fn preferred_currency(&self) -> Option<Address> {
         self.preferred_currency
     }
@@ -193,6 +201,7 @@ impl TempoAccountsProvider {
             default_deposit: None,
             top_up_amount: None,
             max_deposit: None,
+            fee_token: None,
         });
         self
     }
@@ -221,6 +230,14 @@ impl TempoAccountsProvider {
         self
     }
 
+    /// Pay gas for unsponsored session opens and top-ups in `token`.
+    pub fn with_session_fee_token(mut self, token: Address) -> Self {
+        if let Some(session) = self.session.as_mut() {
+            session.fee_token = Some(token);
+        }
+        self
+    }
+
     fn configured_session_provider(&self) -> Result<TempoSessionProvider, MppError> {
         let session = self.session.as_ref().ok_or_else(|| {
             MppError::UnsupportedPaymentMethod("tempo.session is not configured".to_owned())
@@ -240,6 +257,9 @@ impl TempoAccountsProvider {
         }
         if let Some(amount) = session.max_deposit {
             provider = provider.with_max_deposit(amount);
+        }
+        if let Some(token) = session.fee_token {
+            provider = provider.with_fee_token(token);
         }
         *cached = Some(provider.clone());
         Ok(provider)
@@ -359,24 +379,10 @@ impl PaymentProvider for TempoAccountsProvider {
         let Some(preferred_currency) = self.preferred_currency else {
             return Some(first);
         };
-        if first.method.as_str() != crate::protocol::methods::tempo::METHOD_NAME
-            || first.intent.as_str() != crate::protocol::methods::tempo::INTENT_CHARGE
-        {
-            return Some(first);
-        }
         challenges
             .iter()
             .copied()
-            .find(|challenge| {
-                challenge.method.as_str() == first.method.as_str()
-                    && challenge.intent.as_str() == first.intent.as_str()
-                    && challenge
-                        .request
-                        .decode::<ChargeRequest>()
-                        .ok()
-                        .and_then(|request| request.currency.parse::<Address>().ok())
-                        == Some(preferred_currency)
-            })
+            .find(|challenge| funded_by(challenge, preferred_currency))
             .or(Some(first))
     }
 
@@ -495,6 +501,34 @@ impl PaymentProvider for TempoAccountsProvider {
             Some(_) => "tempo/session, tempo/charge;q=0.5".to_owned(),
             None => "tempo/charge".to_owned(),
         })
+    }
+}
+
+/// Whether `challenge` is paid from `currency`: a Tempo charge or session
+/// denominated in it, or a machine-token-enabled charge when `currency` is the
+/// canonical machine token of the charge's chain.
+fn funded_by(challenge: &PaymentChallenge, currency: Address) -> bool {
+    if challenge.method.as_str() != METHOD_NAME {
+        return false;
+    }
+    match challenge.intent.as_str() {
+        INTENT_CHARGE => challenge
+            .request
+            .decode::<ChargeRequest>()
+            .is_ok_and(|request| {
+                request.currency.parse::<Address>().ok() == Some(currency)
+                    || (request.machine_token_enabled()
+                        && request.chain_id().and_then(machine_token::token) == Some(currency))
+            }),
+        INTENT_SESSION => {
+            challenge
+                .request
+                .decode::<SessionRequest>()
+                .ok()
+                .and_then(|request| request.currency.parse::<Address>().ok())
+                == Some(currency)
+        }
+        _ => false,
     }
 }
 
@@ -647,6 +681,48 @@ mod tests {
                 .select_challenge(&[&first, &preferred])
                 .map(|challenge| challenge.id.as_str()),
             Some("preferred")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn offer(id: &str, intent: &str, currency: Address, machine_token: bool) -> PaymentChallenge {
+        let request = Base64UrlJson::from_value(&serde_json::json!({
+            "amount": "1",
+            "currency": currency.to_string(),
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": {"chainId": 4217, "machineTokenEnabled": machine_token},
+        }))
+        .unwrap();
+        PaymentChallenge::new(id, "api.example.com", "tempo", intent, request)
+    }
+
+    #[test]
+    fn prefers_mach_funded_sessions_then_machine_token_charges() {
+        let (provider, path, _) = provider();
+        let usdc = Address::repeat_byte(0x44);
+        let mach = crate::protocol::methods::tempo::machine_token::MACH;
+        let usdc_session = offer("usdc-session", "session", usdc, false);
+        let mach_session = offer("mach-session", "session", mach, false);
+        let usdc_charge = offer("usdc-charge", "charge", usdc, false);
+        let mach_charge = offer("mach-charge", "charge", usdc, true);
+        let provider = provider.with_preferred_currency(mach);
+        let selected = |challenges: &[&PaymentChallenge]| {
+            provider
+                .select_challenge(challenges)
+                .map(|challenge| challenge.id.clone())
+        };
+
+        assert_eq!(
+            selected(&[&usdc_session, &mach_session, &mach_charge]).as_deref(),
+            Some("mach-session")
+        );
+        assert_eq!(
+            selected(&[&usdc_session, &usdc_charge, &mach_charge]).as_deref(),
+            Some("mach-charge")
+        );
+        assert_eq!(
+            selected(&[&usdc_session, &usdc_charge]).as_deref(),
+            Some("usdc-session")
         );
         std::fs::remove_file(path).unwrap();
     }

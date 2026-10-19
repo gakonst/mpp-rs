@@ -114,6 +114,8 @@ pub struct TempoSessionProvider {
     top_up_amount: Option<u128>,
     /// Stablecoin used to acquire the session currency before open/top-up.
     autoswap: Option<AutoswapConfig>,
+    /// Token paying gas for unsponsored opens and top-ups.
+    fee_token: Option<Address>,
     /// Channel registry: key is `payee:currency:escrow` (lowercase).
     channels: Arc<Mutex<HashMap<String, ChannelEntry>>>,
     /// Durable channel view. Recovery policy remains owned by this provider.
@@ -174,6 +176,7 @@ impl TempoSessionProvider {
             default_deposit: None,
             top_up_amount: None,
             autoswap: None,
+            fee_token: None,
             channels: Arc::new(Mutex::new(HashMap::new())),
             channel_store: Arc::new(MemoryChannelStore::default()),
             channel_id_to_key: Arc::new(Mutex::new(HashMap::new())),
@@ -256,6 +259,17 @@ impl TempoSessionProvider {
     /// Get the autoswap configuration, if set.
     pub fn autoswap(&self) -> Option<&AutoswapConfig> {
         self.autoswap.as_ref()
+    }
+
+    /// Pay gas for unsponsored channel opens and top-ups in `token`.
+    ///
+    /// Without it, gas is paid in the autoswap input token, or else in the
+    /// session currency. A recipient-restricted currency such as MACH cannot
+    /// pay its own gas, so a MACH session without fee sponsorship needs a
+    /// separate fee token.
+    pub fn with_fee_token(mut self, token: Address) -> Self {
+        self.fee_token = Some(token);
+        self
     }
 
     /// Persist reusable native MPP channels in `store`.
@@ -342,9 +356,9 @@ impl TempoSessionProvider {
     }
 
     fn fee_token(&self, currency: Address) -> Address {
-        self.autoswap
-            .as_ref()
-            .map_or(currency, |config| config.token_in)
+        self.fee_token
+            .or_else(|| self.autoswap.as_ref().map(|config| config.token_in))
+            .unwrap_or(currency)
     }
 
     fn required_top_up(
@@ -2650,6 +2664,13 @@ mod tests {
         assert_eq!(provider.default_deposit, Some(500_000));
         assert_eq!(provider.autoswap().unwrap().token_in, swap_token);
         assert_eq!(provider.fee_token(Address::repeat_byte(0x44)), swap_token);
+        let fee_token = Address::repeat_byte(0x55);
+        assert_eq!(
+            provider
+                .with_fee_token(fee_token)
+                .fee_token(Address::repeat_byte(0x44)),
+            fee_token
+        );
     }
 
     #[test]
