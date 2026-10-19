@@ -238,6 +238,15 @@ impl TempoAccountsProvider {
         self
     }
 
+    /// Get the session provider that pays this provider's session challenges.
+    ///
+    /// Clones share channel state, so streaming transports can answer
+    /// `payment-need-voucher` events and acknowledge streamed receipts for the
+    /// channels opened through [`PaymentProvider::pay`].
+    pub fn session(&self) -> Result<TempoSessionProvider, MppError> {
+        self.configured_session_provider()
+    }
+
     fn configured_session_provider(&self) -> Result<TempoSessionProvider, MppError> {
         let session = self.session.as_ref().ok_or_else(|| {
             MppError::UnsupportedPaymentMethod("tempo.session is not configured".to_owned())

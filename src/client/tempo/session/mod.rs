@@ -1836,6 +1836,44 @@ impl TempoSessionProvider {
         Ok(())
     }
 
+    /// Resolve a pending channel open that the server reports as accepted.
+    ///
+    /// The payment flow resolves an open from the `Payment-Receipt` header of
+    /// its response. Metered SSE responses report acceptance in the body
+    /// instead, through `payment-receipt` and `payment-need-voucher` events
+    /// carrying the server's accepted cumulative amount. An accepted amount
+    /// covering the open's authorized cumulative amount resolves the open, so
+    /// later vouchers may raise it. Returns whether an open was resolved.
+    pub async fn acknowledge_accepted(
+        &self,
+        channel_id_hex: &str,
+        accepted_cumulative: u128,
+    ) -> Result<bool, MppError> {
+        let channel_id = channel_id_hex
+            .parse::<B256>()
+            .map_err(|_| MppError::InvalidConfig("invalid session channel ID".into()))?
+            .to_string();
+        if !self.pending_opens.lock().unwrap().contains_key(&channel_id) {
+            return Ok(false);
+        }
+        let entry = {
+            let key = self
+                .channel_id_to_key
+                .lock()
+                .unwrap()
+                .get(&channel_id)
+                .cloned();
+            key.and_then(|key| self.channels.lock().unwrap().get(&key).cloned())
+        };
+        let Some(entry) = entry.filter(|entry| accepted_cumulative >= entry.cumulative_amount)
+        else {
+            return Ok(false);
+        };
+        self.commit_referenced_open(&channel_id);
+        self.persist_channel(&entry).await?;
+        Ok(true)
+    }
+
     /// Close the payment channel and settle on-chain.
     ///
     /// Sends a close credential to the server, which triggers on-chain settlement.
@@ -3515,6 +3553,39 @@ mod tests {
         assert!(provider.channel_id_to_key.lock().unwrap().is_empty());
         assert!(provider.pending_opens.lock().unwrap().is_empty());
         assert!(store.get(&store_key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn streamed_acceptance_resolves_a_covered_pending_open() {
+        let provider = make_test_provider();
+        let channel_id = seed_precompile_channel(
+            &provider,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            500,
+            1_000,
+        );
+        let channel = channel_id.to_string();
+        provider.pending_opens.lock().unwrap().insert(
+            channel.clone(),
+            PendingOpen {
+                challenge_id: "open".into(),
+                store_key: None,
+            },
+        );
+
+        assert!(!provider.acknowledge_accepted(&channel, 499).await.unwrap());
+        assert!(provider
+            .pending_opens
+            .lock()
+            .unwrap()
+            .contains_key(&channel));
+        assert!(provider
+            .acknowledge_accepted(&channel.to_uppercase().replacen("0X", "0x", 1), 500)
+            .await
+            .unwrap());
+        assert!(provider.pending_opens.lock().unwrap().is_empty());
+        assert!(!provider.acknowledge_accepted(&channel, 900).await.unwrap());
     }
 
     // --- send_voucher error paths ---
